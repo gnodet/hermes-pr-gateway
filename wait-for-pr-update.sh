@@ -127,6 +127,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ETAG_FILE="${SCRIPT_DIR}/.wait-pr-${PR_NUMBER}-etag-$(echo "$REPO" | tr '/' '-')"
+trap "rm -f \"$ETAG_FILE\"" EXIT
 
 # Snapshot: latest commit SHA, comment count, PR state
 get_pr_snapshot() {
