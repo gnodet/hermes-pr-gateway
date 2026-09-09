@@ -268,12 +268,29 @@ def _repos_with_poll_wildcard() -> set[str]:
     return repos
 
 
+def _check_repo_changed(repo: str, etag: str | None) -> tuple[bool, str | None]:
+    """ETag-conditional GET on the repo resource itself.
+
+    Returns (changed, new_etag).
+    - (False, None)      — 304, repo unchanged, skip PR list fetch
+    - (True,  new_etag)  — 200, something changed, fetch PR list
+    - (True,  None)      — error, fetch PR list to be safe
+    """
+    try:
+        status, _, new_etag = gh_get(f"repos/{repo}", etag=etag)
+        if status == 304:
+            return False, None
+        return True, new_etag
+    except Exception as e:
+        log.warning("Failed to check repo %s: %s", repo, e)
+        return True, None  # err on the side of discovery
+
+
 def _discover_open_prs(repo: str) -> list[int]:
-    """Fetch open PR numbers for a repo via GitHub API. Returns [] on error."""
+    """Fetch the list of open PR numbers for a repo. Returns [] on error."""
     try:
         status, data, _ = gh_get(
             f"repos/{repo}/pulls?state=open&per_page=100",
-            etag=None,
         )
         if status in (200, 201) and isinstance(data, list):
             return [pr["number"] for pr in data if isinstance(pr, dict) and "number" in pr]
@@ -754,53 +771,61 @@ def _dispatch_signals(prkey: str, signals: list[str]) -> None:
 
 def poller_loop() -> None:
     log.info("Poller started (interval=%ds)", POLL_INTERVAL)
-    # Track per-repo discovery: last time we fetched the open PR list
-    _repo_discovery_ts: dict[str, float] = {}
-    DISCOVERY_INTERVAL = 120  # re-fetch open PR list every 2 minutes
+    # Per-repo discovery state: {repo: {"ts": float, "etag": str|None}}
+    _repo_disc: dict[str, dict] = {}
+    DISCOVERY_INTERVAL = 120  # check repo ETag every 2 minutes
 
     while True:
         # --- Repo-level discovery for poll wildcards ---
-        # For repos with a pr=0 poll listener, periodically fetch the open PR
-        # list and register _pr_state for each open PR so the poller tracks them.
+        # Gate: ETag-conditional GET on the repo itself (1 cheap call per repo).
+        # Only fetch the open PR list when the repo ETag changes (200 vs 304).
         poll_wildcard_repos = _repos_with_poll_wildcard()
         now = time.time()
         for repo in poll_wildcard_repos:
-            last_disc = _repo_discovery_ts.get(repo, 0)
-            if now - last_disc >= DISCOVERY_INTERVAL:
-                pr_numbers = _discover_open_prs(repo)
-                _repo_discovery_ts[repo] = time.time()
-                log.info("Discovered %d open PRs for %s: %s", len(pr_numbers), repo,
-                         pr_numbers[:10])
-                with _registry_lock:
-                    open_set = set(pr_numbers)
-                    for pr_num in pr_numbers:
-                        prkey = _pr_key(repo, pr_num)
-                        if prkey not in _pr_state:
-                            _pr_state[prkey] = {
-                                "repo":         repo,
-                                "pr":           pr_num,
-                                "_etag":        None,
-                                "_head_sha":    None,
-                                "_ci_status":   None,
-                                "_updated_at":  None,
-                                "_last_polled": None,
-                            }
-                            log.info("Auto-registered PR state for %s#%d (wildcard poll)",
-                                     repo, pr_num)
+            disc = _repo_disc.setdefault(repo, {"ts": 0, "etag": None})
+            if now - disc["ts"] < DISCOVERY_INTERVAL:
+                continue
 
-                    # Purge _pr_state entries for PRs no longer open and with
-                    # no direct (non-wildcard) listeners — they were closed/merged
-                    # without emitting a terminal signal (e.g. closed via UI during
-                    # a polling gap).
-                    stale = [
-                        pk for pk in list(_pr_state)
-                        if _pr_state[pk]["repo"] == repo
-                        and _pr_state[pk]["pr"] not in open_set
-                        and not _pr_has_direct_listeners(pk)
-                    ]
-                    for pk in stale:
-                        del _pr_state[pk]
-                        log.info("Purged stale PR state for %s (no longer open)", pk)
+            changed, new_etag = _check_repo_changed(repo, disc["etag"])
+            disc["ts"] = time.time()
+            if new_etag:
+                disc["etag"] = new_etag
+
+            if not changed:
+                log.debug("Repo %s unchanged (304) — skipping PR discovery", repo)
+                continue
+
+            pr_numbers = _discover_open_prs(repo)
+            log.info("Discovered %d open PRs for %s: %s", len(pr_numbers), repo,
+                     pr_numbers[:10])
+            with _registry_lock:
+                open_set = set(pr_numbers)
+                for pr_num in pr_numbers:
+                    prkey = _pr_key(repo, pr_num)
+                    if prkey not in _pr_state:
+                        _pr_state[prkey] = {
+                            "repo":         repo,
+                            "pr":           pr_num,
+                            "_etag":        None,
+                            "_head_sha":    None,
+                            "_ci_status":   None,
+                            "_updated_at":  None,
+                            "_last_polled": None,
+                        }
+                        log.info("Auto-registered PR state for %s#%d (wildcard poll)",
+                                 repo, pr_num)
+
+                # Purge _pr_state entries for PRs no longer open and with
+                # no direct (non-wildcard) listeners — closed/merged during a gap.
+                stale = [
+                    pk for pk in list(_pr_state)
+                    if _pr_state[pk]["repo"] == repo
+                    and _pr_state[pk]["pr"] not in open_set
+                    and not _pr_has_direct_listeners(pk)
+                ]
+                for pk in stale:
+                    del _pr_state[pk]
+                    log.info("Purged stale PR state for %s (no longer open)", pk)
 
 
         # --- Poll registered PRs ---
