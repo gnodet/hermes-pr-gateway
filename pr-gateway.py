@@ -270,32 +270,31 @@ def _repos_with_poll_wildcard() -> set[str]:
 
 def _check_pulls_changed(
     repo: str, etag: str | None
-) -> tuple[bool, list[int], str | None]:
+) -> tuple[bool, list[int], list[dict], str | None]:
     """ETag-conditional GET on the open PR list.
 
     Uses GET /repos/{repo}/pulls?state=open as the gate — this ETag changes
     on pushes, PR open/close, AND PR comments (unlike the repo-level ETag
-    which misses comments).
+    which misses comments entirely).
 
-    Returns (changed, pr_numbers, new_etag):
-    - (False, [],        None)      — 304, nothing changed, skip everything
-    - (True,  [pr, ...], new_etag)  — 200, something changed, pr_numbers populated
-    - (True,  [],        None)      — error, trigger discovery to be safe
+    Returns (changed, pr_numbers, pr_objects, new_etag):
+    - (False, [],        [],          None)      — 304, nothing changed
+    - (True,  [pr, ...], [{...}, ...], new_etag)  — 200, pr_objects has full PR data
+    - (True,  [],        [],          None)      — error, trigger discovery to be safe
     """
     try:
         status, data, new_etag = gh_get(
             f"repos/{repo}/pulls?state=open&per_page=100", etag=etag
         )
         if status == 304:
-            return False, [], None
+            return False, [], [], None
         if status in (200, 201) and isinstance(data, list):
-            pr_numbers = [
-                pr["number"] for pr in data if isinstance(pr, dict) and "number" in pr
-            ]
-            return True, pr_numbers, new_etag
+            pr_objects = [pr for pr in data if isinstance(pr, dict) and "number" in pr]
+            pr_numbers = [pr["number"] for pr in pr_objects]
+            return True, pr_numbers, pr_objects, new_etag
     except Exception as e:
         log.warning("Failed to check pulls for %s: %s", repo, e)
-    return True, [], None  # err on the side of discovery
+    return True, [], [], None  # err on the side of discovery
 
 
 def _pr_has_listeners(pr_key: str) -> bool:
@@ -791,7 +790,7 @@ def poller_loop() -> None:
                     unchanged_repos.add(repo)
                 continue
 
-            changed, pr_numbers, new_etag = _check_pulls_changed(repo, disc["etag"])
+            changed, pr_numbers, pr_objects, new_etag = _check_pulls_changed(repo, disc["etag"])
             disc["ts"] = time.time()
             if new_etag:
                 disc["etag"] = new_etag
@@ -807,8 +806,9 @@ def poller_loop() -> None:
                      pr_numbers[:10])
             with _registry_lock:
                 open_set = set(pr_numbers)
-                for pr_num in pr_numbers:
-                    prkey = _pr_key(repo, pr_num)
+                for pr_obj in pr_objects:
+                    pr_num = pr_obj["number"]
+                    prkey  = _pr_key(repo, pr_num)
                     if prkey not in _pr_state:
                         _pr_state[prkey] = {
                             "repo":         repo,
@@ -834,6 +834,61 @@ def poller_loop() -> None:
                     del _pr_state[pk]
                     log.info("Purged stale PR state for %s (no longer open)", pk)
 
+            # --- Process PR objects directly from /pulls body ---
+            # For wildcard-poll repos, we can extract signals from the listing
+            # without making per-PR timeline requests. The /pulls response gives
+            # us head.sha and updated_at for each PR — enough to detect PUSHED
+            # and NEW_COMMENTS. CI status needs a separate call only when sha changed.
+            for pr_obj in pr_objects:
+                pr_num = pr_obj["number"]
+                prkey  = _pr_key(repo, pr_num)
+
+                with _registry_lock:
+                    if not _pr_has_poll_listeners(prkey):
+                        continue
+                    state = dict(_pr_state.get(prkey, {}))
+
+                if not state:
+                    continue
+
+                cur_sha     = (pr_obj.get("head") or {}).get("sha")
+                cur_updated = pr_obj.get("updated_at")
+                prev_sha    = state.get("_head_sha")
+                prev_ci     = state.get("_ci_status")
+                prev_updated = state.get("_updated_at")
+
+                # First time — initialise state, emit nothing
+                if prev_sha is None:
+                    cur_ci = get_ci_status(repo, cur_sha) if cur_sha else "unknown"
+                    _update_pr_state(prkey,
+                        _head_sha=cur_sha, _ci_status=cur_ci,
+                        _updated_at=cur_updated, _last_polled=time.time())
+                    log.info("Initialised state for %s (sha=%.8s, ci=%s)",
+                             prkey, cur_sha or "?", cur_ci)
+                    continue
+
+                signals = []
+
+                if cur_sha and cur_sha != prev_sha:
+                    signals.append("PUSHED")
+                    cur_ci = get_ci_status(repo, cur_sha)
+                    if cur_ci == "failure" and prev_ci != "failure":
+                        signals.append("CI_FAILED")
+                    elif cur_ci == "success" and (prev_ci != "success" or cur_sha != prev_sha):
+                        signals.append("CI_GREEN")
+                    _update_pr_state(prkey,
+                        _head_sha=cur_sha, _ci_status=cur_ci,
+                        _updated_at=cur_updated, _last_polled=time.time())
+                elif prev_updated and cur_updated and cur_updated != prev_updated:
+                    signals.append("NEW_COMMENTS")
+                    _update_pr_state(prkey,
+                        _updated_at=cur_updated, _last_polled=time.time())
+
+                if signals:
+                    for sig in signals:
+                        _record("poll_signal", repo, pr_num, sig, detail="pulls_body")
+                    _dispatch_signals(prkey, signals)
+
 
         # --- Poll registered PRs ---
         pr_states = _get_pr_state_snapshot()
@@ -848,9 +903,14 @@ def poller_loop() -> None:
                 if not _pr_has_poll_listeners(prkey):
                     continue
 
-            # Skip PRs belonging to repos whose /pulls list was 304 this cycle —
-            # if the list didn't change, no push or comment happened, nothing to do.
+            # PRs in wildcard-poll repos are already handled via the /pulls body above.
+            # Only fall through to timeline polling for PRs with direct (non-wildcard)
+            # listeners in those repos, or for PRs in non-wildcard repos.
             pr_repo = state.get("repo", prkey.split("#")[0])
+            if pr_repo in poll_wildcard_repos and not _pr_has_direct_listeners(prkey):
+                continue
+
+            # Skip PRs belonging to repos whose /pulls list was 304 this cycle.
             if pr_repo in unchanged_repos:
                 log.debug("Skipping poll for %s — repo pulls unchanged (304)", prkey)
                 continue
