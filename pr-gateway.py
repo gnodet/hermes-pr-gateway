@@ -268,35 +268,34 @@ def _repos_with_poll_wildcard() -> set[str]:
     return repos
 
 
-def _check_repo_changed(repo: str, etag: str | None) -> tuple[bool, str | None]:
-    """ETag-conditional GET on the repo resource itself.
+def _check_pulls_changed(
+    repo: str, etag: str | None
+) -> tuple[bool, list[int], str | None]:
+    """ETag-conditional GET on the open PR list.
 
-    Returns (changed, new_etag).
-    - (False, None)      — 304, repo unchanged, skip PR list fetch
-    - (True,  new_etag)  — 200, something changed, fetch PR list
-    - (True,  None)      — error, fetch PR list to be safe
+    Uses GET /repos/{repo}/pulls?state=open as the gate — this ETag changes
+    on pushes, PR open/close, AND PR comments (unlike the repo-level ETag
+    which misses comments).
+
+    Returns (changed, pr_numbers, new_etag):
+    - (False, [],        None)      — 304, nothing changed, skip everything
+    - (True,  [pr, ...], new_etag)  — 200, something changed, pr_numbers populated
+    - (True,  [],        None)      — error, trigger discovery to be safe
     """
     try:
-        status, _, new_etag = gh_get(f"repos/{repo}", etag=etag)
-        if status == 304:
-            return False, None
-        return True, new_etag
-    except Exception as e:
-        log.warning("Failed to check repo %s: %s", repo, e)
-        return True, None  # err on the side of discovery
-
-
-def _discover_open_prs(repo: str) -> list[int]:
-    """Fetch the list of open PR numbers for a repo. Returns [] on error."""
-    try:
-        status, data, _ = gh_get(
-            f"repos/{repo}/pulls?state=open&per_page=100",
+        status, data, new_etag = gh_get(
+            f"repos/{repo}/pulls?state=open&per_page=100", etag=etag
         )
+        if status == 304:
+            return False, [], None
         if status in (200, 201) and isinstance(data, list):
-            return [pr["number"] for pr in data if isinstance(pr, dict) and "number" in pr]
+            pr_numbers = [
+                pr["number"] for pr in data if isinstance(pr, dict) and "number" in pr
+            ]
+            return True, pr_numbers, new_etag
     except Exception as e:
-        log.warning("Failed to discover PRs for %s: %s", repo, e)
-    return []
+        log.warning("Failed to check pulls for %s: %s", repo, e)
+    return True, [], None  # err on the side of discovery
 
 
 def _pr_has_listeners(pr_key: str) -> bool:
@@ -781,21 +780,29 @@ def poller_loop() -> None:
         # Only fetch the open PR list when the repo ETag changes (200 vs 304).
         poll_wildcard_repos = _repos_with_poll_wildcard()
         now = time.time()
+        # Track repos whose pulls list is unchanged (304) — skip their PR polling too
+        unchanged_repos: set[str] = set()
         for repo in poll_wildcard_repos:
             disc = _repo_disc.setdefault(repo, {"ts": 0, "etag": None})
             if now - disc["ts"] < DISCOVERY_INTERVAL:
+                # Not time for a discovery check yet — but if we had a 304 last
+                # time, still skip polling for this repo this cycle.
+                if disc.get("last_304"):
+                    unchanged_repos.add(repo)
                 continue
 
-            changed, new_etag = _check_repo_changed(repo, disc["etag"])
+            changed, pr_numbers, new_etag = _check_pulls_changed(repo, disc["etag"])
             disc["ts"] = time.time()
             if new_etag:
                 disc["etag"] = new_etag
 
             if not changed:
-                log.debug("Repo %s unchanged (304) — skipping PR discovery", repo)
+                log.debug("Pulls for %s unchanged (304) — skipping PR discovery and polling", repo)
+                disc["last_304"] = True
+                unchanged_repos.add(repo)
                 continue
 
-            pr_numbers = _discover_open_prs(repo)
+            disc["last_304"] = False
             log.info("Discovered %d open PRs for %s: %s", len(pr_numbers), repo,
                      pr_numbers[:10])
             with _registry_lock:
@@ -840,6 +847,13 @@ def poller_loop() -> None:
             with _registry_lock:
                 if not _pr_has_poll_listeners(prkey):
                     continue
+
+            # Skip PRs belonging to repos whose /pulls list was 304 this cycle —
+            # if the list didn't change, no push or comment happened, nothing to do.
+            pr_repo = state.get("repo", prkey.split("#")[0])
+            if pr_repo in unchanged_repos:
+                log.debug("Skipping poll for %s — repo pulls unchanged (304)", prkey)
+                continue
 
             try:
                 signals = _poll_pr(prkey, state)
