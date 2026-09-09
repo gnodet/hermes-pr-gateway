@@ -1,0 +1,15 @@
+# Runtime files — never commit these
+pr-gateway.pid
+pr-gateway.log
+pr-gateway-registry.json
+*.env
+.secrets/
+
+# ETag state files (created by wait-for-pr-update.sh)
+.wait-pr-*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
