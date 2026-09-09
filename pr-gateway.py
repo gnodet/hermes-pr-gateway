@@ -237,12 +237,49 @@ def _pr_key(repo: str, pr: int) -> str:
 
 
 def _pr_has_poll_listeners(pr_key: str) -> bool:
-    """Return True if at least one poll-sourced listener exists for this PR."""
+    """Return True if at least one poll-sourced listener exists for this PR.
+
+    Includes direct listeners on this PR AND repo-level wildcard (pr=0) poll
+    listeners — wildcards rely on the poller discovering and tracking real PRs.
+    """
     prefix = pr_key + "@"
+    repo = pr_key.split("#")[0]
+    wildcard_prefix = _pr_key(repo, 0) + "@"
     return any(
-        k.startswith(prefix) and _listeners[k].get("source", "poll") == "poll"
+        (k.startswith(prefix) or k.startswith(wildcard_prefix))
+        and _listeners[k].get("source", "poll") == "poll"
         for k in _listeners
     )
+
+
+def _pr_has_direct_listeners(pr_key: str) -> bool:
+    """Return True if at least one non-wildcard listener is registered for this PR."""
+    prefix = pr_key + "@"
+    return any(k.startswith(prefix) for k in _listeners)
+
+
+def _repos_with_poll_wildcard() -> set[str]:
+    """Return the set of repos that have a wildcard (pr=0) poll listener."""
+    repos = set()
+    with _registry_lock:
+        for k, v in _listeners.items():
+            if v.get("pr") == 0 and v.get("source", "poll") == "poll":
+                repos.add(v["repo"])
+    return repos
+
+
+def _discover_open_prs(repo: str) -> list[int]:
+    """Fetch open PR numbers for a repo via GitHub API. Returns [] on error."""
+    try:
+        status, data, _ = gh_get(
+            f"repos/{repo}/pulls?state=open&per_page=100",
+            etag=None,
+        )
+        if status in (200, 201) and isinstance(data, list):
+            return [pr["number"] for pr in data if isinstance(pr, dict) and "number" in pr]
+    except Exception as e:
+        log.warning("Failed to discover PRs for %s: %s", repo, e)
+    return []
 
 
 def _pr_has_listeners(pr_key: str) -> bool:
@@ -311,9 +348,10 @@ def add_watch(entry: dict) -> tuple[bool, str]:
     if source not in ("poll", "webhook"):
         return False, "source must be 'poll' or 'webhook'"
 
-    # Wildcard (pr=0) only makes sense with webhook source — poller needs a real PR
-    if pr == 0 and source != "webhook":
-        return False, "pr=0 (wildcard) requires source='webhook'"
+    # Wildcard (pr=0) with source=poll: the poller will discover open PRs for this
+    # repo and poll them individually. source=webhook is still recommended when
+    # admin access is available (lower latency, zero polling cost).
+    # No validation error — both combinations are supported.
 
     lkey  = _listener_key(repo, pr, route)
     prkey = _pr_key(repo, pr)
@@ -716,7 +754,56 @@ def _dispatch_signals(prkey: str, signals: list[str]) -> None:
 
 def poller_loop() -> None:
     log.info("Poller started (interval=%ds)", POLL_INTERVAL)
+    # Track per-repo discovery: last time we fetched the open PR list
+    _repo_discovery_ts: dict[str, float] = {}
+    DISCOVERY_INTERVAL = 120  # re-fetch open PR list every 2 minutes
+
     while True:
+        # --- Repo-level discovery for poll wildcards ---
+        # For repos with a pr=0 poll listener, periodically fetch the open PR
+        # list and register _pr_state for each open PR so the poller tracks them.
+        poll_wildcard_repos = _repos_with_poll_wildcard()
+        now = time.time()
+        for repo in poll_wildcard_repos:
+            last_disc = _repo_discovery_ts.get(repo, 0)
+            if now - last_disc >= DISCOVERY_INTERVAL:
+                pr_numbers = _discover_open_prs(repo)
+                _repo_discovery_ts[repo] = time.time()
+                log.info("Discovered %d open PRs for %s: %s", len(pr_numbers), repo,
+                         pr_numbers[:10])
+                with _registry_lock:
+                    open_set = set(pr_numbers)
+                    for pr_num in pr_numbers:
+                        prkey = _pr_key(repo, pr_num)
+                        if prkey not in _pr_state:
+                            _pr_state[prkey] = {
+                                "repo":         repo,
+                                "pr":           pr_num,
+                                "_etag":        None,
+                                "_head_sha":    None,
+                                "_ci_status":   None,
+                                "_updated_at":  None,
+                                "_last_polled": None,
+                            }
+                            log.info("Auto-registered PR state for %s#%d (wildcard poll)",
+                                     repo, pr_num)
+
+                    # Purge _pr_state entries for PRs no longer open and with
+                    # no direct (non-wildcard) listeners — they were closed/merged
+                    # without emitting a terminal signal (e.g. closed via UI during
+                    # a polling gap).
+                    stale = [
+                        pk for pk in list(_pr_state)
+                        if _pr_state[pk]["repo"] == repo
+                        and _pr_state[pk]["pr"] not in open_set
+                        and not _pr_has_direct_listeners(pk)
+                    ]
+                    for pk in stale:
+                        del _pr_state[pk]
+                        log.info("Purged stale PR state for %s (no longer open)", pk)
+
+
+        # --- Poll registered PRs ---
         pr_states = _get_pr_state_snapshot()
 
         if not pr_states:
