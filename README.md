@@ -1,8 +1,8 @@
-# hermes-pr-gateway
+# pr-gateway
 
-An event-driven GitHub PR watcher daemon that bridges GitHub activity to [Hermes Agent](https://hermes-agent.nousresearch.com) webhook routes.
+An event-driven GitHub PR watcher daemon. It monitors pull requests via GitHub webhooks and/or polling, translates raw GitHub events into a clean signal vocabulary (`PUSHED`, `CI_GREEN`, `APPROVED`, …), and POSTs them as HMAC-signed JSON to any webhook endpoint — an AI agent, a CI orchestrator, a custom script, or anything else that accepts HTTP callbacks.
 
-It monitors pull requests via GitHub webhooks and/or polling, detects meaningful state changes, and fires signals to Hermes automation routes (e.g. `babysit-pr`, `review-loop`).
+The output format is intentionally generic: standard `X-Hub-Signature-256` signing, plain JSON body. The author uses it with [Hermes Agent](https://hermes-agent.nousresearch.com), but there is no hard dependency on it.
 
 ## How it works
 
@@ -15,13 +15,10 @@ GitHub webhooks / polling
   └── :8646              Webhook receiver (public, receives GitHub events)
         │
         ▼  signals: PUSHED, CI_GREEN, CI_FAILED, APPROVED, ...
-  Hermes webhook route   (http://localhost:8644/webhooks/<route>)
-        │
-        ▼
-  Hermes agent           (babysit-pr, review-loop, ...)
+  Your webhook endpoint  (any HTTP server that accepts signed JSON)
 ```
 
-### Signals
+## Signals
 
 | Signal | Trigger |
 |--------|---------|
@@ -39,16 +36,36 @@ GitHub webhooks / polling
 | `REVIEW_REQUESTED` | Review requested |
 | `LABELED` | Label added or removed |
 
-### Source modes
+## Payload format
 
-- **`poll`** (default): pr-gateway polls GitHub every 30s using ETag-conditional requests (304s are free). Good for repos where you can't install webhooks, or as a fallback.
-- **`webhook`**: GitHub sends events directly to `:8646/github/{owner}/{repo}`. Zero-latency, no polling needed. Supports wildcard listeners (`pr=0`) for repo-level automation that fires on any PR.
+Each signal is delivered as an HMAC-signed (`X-Hub-Signature-256`) JSON POST:
 
-Both modes can coexist — a PR can have poll and webhook listeners simultaneously.
+```json
+{
+  "source":          "pr-gateway",
+  "signal":          "CI_GREEN",
+  "repo":            "owner/repo",
+  "pr":              123,
+  "branch":          "fix/my-branch",
+  "worktree":        "/optional/local/path",
+  "deliver_chat_id": "origin"
+}
+```
 
-### Coalescing + serialization
+The `X-GitHub-Event` header is set to `pr_gateway`. Receivers that validate GitHub webhook signatures will accept the payload as-is.
 
-GitHub fires many `check_run` events per CI run (one per job). pr-gateway coalesces identical signals within a 15-second trailing-edge window before dispatching. Additionally, only one agent invocation runs per listener at a time — new signals that arrive while an agent is running are queued and dispatched in a batch when it finishes.
+`deliver_chat_id` and `worktree` are pass-through fields — pr-gateway stores whatever value was registered with the listener and echoes it back in every signal. They are ignored by receivers that don't use them.
+
+## Source modes
+
+- **`poll`** (default): pr-gateway polls GitHub every 30s using ETag-conditional requests (304s are free). Works for any repo, no webhook setup needed.
+- **`webhook`**: GitHub sends events directly to `:8646/github/{owner}/{repo}`. Zero-latency. Supports wildcard listeners (`pr=0`) that fire for any PR on the repo.
+
+Both modes can coexist on the same listener.
+
+## Coalescing + serialization
+
+GitHub fires many `check_run` events per CI run (one per job). pr-gateway coalesces identical signals within a 15-second trailing-edge window before dispatching. Additionally, only one dispatch runs per listener at a time — new signals that arrive while a handler is running are queued and flushed in a batch when it finishes.
 
 Signal cancellation rules:
 - `PUSHED` supersedes `CI_GREEN` and `CI_FAILED` (new commit invalidates previous CI state)
@@ -68,7 +85,6 @@ Signal cancellation rules:
 - Python 3.11+ (stdlib only — no pip dependencies)
 - `curl` and `gh` CLI (for `wait-for-pr-update.sh` only)
 - A GitHub token with `repo` scope
-- A running [Hermes Agent](https://hermes-agent.nousresearch.com) instance with the webhook gateway enabled
 
 ## Setup
 
@@ -79,59 +95,58 @@ echo "ghp_yourtoken" > ~/.secrets/gh-token
 chmod 600 ~/.secrets/gh-token
 ```
 
-Or set `GH_TOKEN` in the environment / secrets file.
+Or set `GH_TOKEN` in the environment.
 
 ### 2. Secrets file
 
 Create a secrets file (do **not** commit this):
 
 ```bash
-# ~/.secrets/pr-gateway-webhook-secrets.env
+# ~/.secrets/pr-gateway.env
 
-# Hermes webhook shared secret (generate with: python3 -c "import secrets; print(secrets.token_hex(32))")
-PR_GATEWAY_HERMES_SECRET=your-hermes-webhook-secret
+# Shared secret for signing outbound webhook payloads
+# Generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
+PR_GATEWAY_WEBHOOK_SECRET=your-shared-secret
 
 # Per-repo GitHub webhook secrets (double-underscore = slash in repo name)
 WEBHOOK_SECRET_apache__maven=your-github-webhook-secret-for-apache-maven
-WEBHOOK_SECRET_maveniverse__scalpel=your-github-webhook-secret-for-scalpel
+WEBHOOK_SECRET_owner__repo=your-github-webhook-secret-for-another-repo
 ```
 
-### 3. Configure Hermes
+### 3. Configure your webhook receiver
 
-In your Hermes `config.yaml`, define the webhook routes:
+The outbound payload is signed with `X-Hub-Signature-256` using `PR_GATEWAY_WEBHOOK_SECRET`. Configure your receiver to validate that header with the same secret.
 
+**Example: Hermes Agent** (`config.yaml`):
 ```yaml
 webhooks:
   routes:
-    babysit-pr:
-      secret: "your-hermes-webhook-secret"   # must match PR_GATEWAY_HERMES_SECRET
-      deliver: origin
-    review-loop:
-      secret: "your-hermes-webhook-secret"
+    my-route:
+      secret: "your-shared-secret"   # must match PR_GATEWAY_WEBHOOK_SECRET
       deliver: origin
 ```
 
 ### 4. Start the daemon
 
 ```bash
-# Using the control script
-PR_GATEWAY_HERMES_SECRET=... ./pr-gateway-ctl.sh start
+# Using the control script (loads secrets from SECRETS_FILE)
+SECRETS_FILE=~/.secrets/pr-gateway.env ./pr-gateway-ctl.sh start
 
-# Or with a secrets file
-SECRETS_FILE=~/.secrets/pr-gateway-webhook-secrets.env ./pr-gateway-ctl.sh start
+# Or with env vars directly
+PR_GATEWAY_WEBHOOK_SECRET=... PR_GATEWAY_TARGET_URL=http://localhost:8644 ./pr-gateway-ctl.sh start
 
-# Or directly
-PR_GATEWAY_HERMES_SECRET=... python3 pr-gateway.py
+# Or run directly
+PR_GATEWAY_WEBHOOK_SECRET=... python3 pr-gateway.py
 ```
 
 ### 5. Register listeners
 
 ```bash
-# Poll-based listener: watch apache/maven PR #1234, call the babysit-pr route
+# Poll-based: watch apache/maven PR #1234, POST to the "my-route" endpoint
 curl -X POST http://localhost:8645/watch -H 'Content-Type: application/json' -d '{
   "repo": "apache/maven",
   "pr": 1234,
-  "route": "babysit-pr",
+  "route": "my-route",
   "signals": ["*"],
   "source": "poll",
   "branch": "fix/my-branch",
@@ -139,11 +154,11 @@ curl -X POST http://localhost:8645/watch -H 'Content-Type: application/json' -d 
   "deliver": "origin"
 }'
 
-# Webhook-based wildcard: fire on any new PR opened in maveniverse/scalpel
+# Webhook-based wildcard: fire on any PR opened in owner/repo
 curl -X POST http://localhost:8645/watch -H 'Content-Type: application/json' -d '{
-  "repo": "maveniverse/scalpel",
+  "repo": "owner/repo",
   "pr": 0,
-  "route": "review-loop",
+  "route": "my-route",
   "signals": ["OPENED", "PUSHED"],
   "source": "webhook"
 }'
@@ -154,8 +169,8 @@ curl -X POST http://localhost:8645/watch -H 'Content-Type: application/json' -d 
 In the GitHub repo settings → Webhooks → Add webhook:
 - **Payload URL**: `https://your-host.example.com/github/owner/repo`
 - **Content type**: `application/json`
-- **Secret**: the per-repo secret you set in `WEBHOOK_SECRET_owner__repo`
-- **Events**: select the events you want (at minimum: Pull requests, Check runs, Pull request reviews, Issue comments)
+- **Secret**: the per-repo secret from `WEBHOOK_SECRET_owner__repo`
+- **Events**: Pull requests, Check runs, Pull request reviews, Issue comments
 
 ## API reference
 
@@ -165,7 +180,7 @@ In the GitHub repo settings → Webhooks → Add webhook:
 {
   "repo":     "owner/repo",
   "pr":       123,
-  "route":    "babysit-pr",
+  "route":    "my-route",
   "signals":  ["*"],
   "source":   "poll",
   "branch":   "fix/my-branch",
@@ -192,7 +207,7 @@ In the GitHub repo settings → Webhooks → Add webhook:
 {"repo": "owner/repo", "pr": 123, "signal": "PUSHED"}
 ```
 
-Useful for testing or manually re-triggering an agent.
+Useful for testing or manually re-triggering a handler.
 
 ### `POST /repo-secret` — Set a per-repo webhook secret at runtime
 
@@ -204,13 +219,13 @@ Useful for testing or manually re-triggering an agent.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `PR_GATEWAY_HERMES_SECRET` | *(required)* | Shared secret for Hermes webhook HMAC |
+| `PR_GATEWAY_WEBHOOK_SECRET` | *(required)* | Shared secret for signing outbound payloads (`X-Hub-Signature-256`) |
+| `PR_GATEWAY_TARGET_URL` | `http://localhost:8644` | Base URL of the webhook receiver |
 | `PR_GATEWAY_PORT` | `8645` | Internal API port |
 | `PR_GATEWAY_GH_PORT` | `8646` | Public GitHub webhook receiver port |
-| `PR_GATEWAY_HERMES_URL` | `http://localhost:8644` | Hermes gateway base URL |
 | `PR_GATEWAY_POLL_INTERVAL` | `30` | GitHub poll interval in seconds |
 | `GH_TOKEN` | *(from `~/.secrets/gh-token`)* | GitHub API token |
-| `WEBHOOK_SECRET_owner__repo` | *(falls back to `HERMES_SECRET`)* | Per-repo GitHub webhook secret |
+| `WEBHOOK_SECRET_owner__repo` | *(falls back to `PR_GATEWAY_WEBHOOK_SECRET`)* | Per-repo GitHub webhook secret |
 
 ## systemd
 

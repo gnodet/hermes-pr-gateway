@@ -66,8 +66,8 @@ PID_FILE      = SCRIPTS_DIR / "pr-gateway.pid"
 
 API_PORT      = int(os.environ.get("PR_GATEWAY_PORT", "8645"))       # internal only
 GH_PORT       = int(os.environ.get("PR_GATEWAY_GH_PORT", "8646"))    # public, GitHub webhooks
-HERMES_URL    = os.environ.get("PR_GATEWAY_HERMES_URL", "http://localhost:8644")
-HERMES_SECRET = os.environ.get("PR_GATEWAY_HERMES_SECRET", "")
+TARGET_URL    = os.environ.get("PR_GATEWAY_TARGET_URL", "http://localhost:8644")
+WEBHOOK_SECRET = os.environ.get("PR_GATEWAY_WEBHOOK_SECRET", "")
 POLL_INTERVAL = int(os.environ.get("PR_GATEWAY_POLL_INTERVAL", "30"))
 GITHUB_API    = "https://api.github.com"
 
@@ -216,7 +216,7 @@ def _run_and_drain(lkey: str, listener: dict, signals: list[str]) -> None:
     repo_pr = f"{listener['repo']}#{listener['pr']}"
     for sig in signals:
         log.info("Dispatching %s → %s [%s]", sig, repo_pr, listener["route"])
-        ok = notify_hermes(listener, sig)
+        ok = notify_target(listener, sig)
         _record("dispatched", listener["repo"], listener["pr"], sig,
                 route=listener["route"],
                 result="ok" if ok else "error")
@@ -559,7 +559,7 @@ def _hmac_signature(secret: str, body: bytes) -> str:
     return "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
 
 
-def notify_hermes(listener: dict, signal: str) -> bool:
+def notify_target(listener: dict, signal: str) -> bool:
     """POST a signal to the Hermes webhook adapter for a specific route."""
     # Parse deliver field: "slack:C0BUUAYDQA1" → deliver_chat_id="C0BUUAYDQA1"
     # For Hermes webhook routes, deliver/deliver_extra are now handled natively in config.yaml.
@@ -580,9 +580,9 @@ def notify_hermes(listener: dict, signal: str) -> bool:
         "deliver_chat_id": deliver_chat_id,
     }
     body = json.dumps(payload).encode()
-    sig  = _hmac_signature(HERMES_SECRET, body)
+    sig  = _hmac_signature(WEBHOOK_SECRET, body)
     route = listener["route"]
-    url  = f"{HERMES_URL}/webhooks/{route}"
+    url  = f"{TARGET_URL}/webhooks/{route}"
 
     try:
         req = Request(
@@ -596,11 +596,11 @@ def notify_hermes(listener: dict, signal: str) -> bool:
             method="POST",
         )
         with urlopen(req, timeout=10) as resp:
-            log.info("Notified Hermes [%s]: %s#%s → %s (HTTP %d)",
+            log.info("Dispatched [%s]: %s#%s → %s (HTTP %d)",
                      route, listener["repo"], listener["pr"], signal, resp.status)
             return True
     except Exception as e:
-        log.error("Failed to notify Hermes [%s] for %s#%s: %s",
+        log.error("Failed to dispatch [%s] for %s#%s: %s",
                   route, listener["repo"], listener["pr"], e)
         return False
 
@@ -1539,7 +1539,7 @@ class GitHubWebhookHandler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", 0))
         body   = self.rfile.read(length) if length else b""
 
-        # Validate HMAC — use per-repo secret if configured, else HERMES_SECRET
+        # Validate HMAC — use per-repo secret if configured, else WEBHOOK_SECRET
         sig    = self.headers.get("X-Hub-Signature-256", "")
         secret = _repo_webhook_secret(repo)
         if not _verify_gh_signature(secret, body, sig):
@@ -1630,7 +1630,7 @@ def _update_pr_state_from_gh(prkey: str, event: str, payload: dict) -> None:
         )
 
 
-# Per-repo webhook secrets — stored in the registry or defaulting to HERMES_SECRET
+# Per-repo webhook secrets — stored in the registry or defaulting to WEBHOOK_SECRET
 _repo_secrets: dict[str, str] = {}
 _repo_secrets_lock = threading.Lock()
 
@@ -1642,7 +1642,7 @@ def set_repo_secret(repo: str, secret: str) -> None:
 
 def _repo_webhook_secret(repo: str) -> str:
     with _repo_secrets_lock:
-        return _repo_secrets.get(repo, HERMES_SECRET)
+        return _repo_secrets.get(repo, WEBHOOK_SECRET)
 
 
 def _load_secrets_from_env() -> None:
@@ -1682,7 +1682,7 @@ def gh_webhook_server() -> None:
 
 def main() -> None:
     log.info("pr-gateway starting (api=%d internal, gh-webhook=%d public, hermes=%s)",
-             API_PORT, GH_PORT, HERMES_URL)
+             API_PORT, GH_PORT, TARGET_URL)
     PID_FILE.write_text(str(os.getpid()))
     load_registry()
     _load_secrets_from_env()

@@ -1,5 +1,5 @@
 [Unit]
-Description=PR Gateway — event-driven PR watcher for Hermes
+Description=PR Gateway — event-driven GitHub PR watcher daemon
 After=network.target
 
 [Service]
@@ -13,12 +13,12 @@ StandardOutput=append:/var/log/pr-gateway.log
 StandardError=append:/var/log/pr-gateway.log
 
 # Required — generate with: python3 -c "import secrets; print(secrets.token_hex(32))"
-Environment=PR_GATEWAY_HERMES_SECRET=change-me
+Environment=PR_GATEWAY_WEBHOOK_SECRET=change-me
 
 # Optional overrides
 Environment=PR_GATEWAY_PORT=8645
 Environment=PR_GATEWAY_GH_PORT=8646
-Environment=PR_GATEWAY_HERMES_URL=http://localhost:8644
+Environment=PR_GATEWAY_TARGET_URL=http://localhost:8644
 Environment=PR_GATEWAY_POLL_INTERVAL=30
 
 # Per-repo webhook secrets (double-underscore separates owner from repo name)
