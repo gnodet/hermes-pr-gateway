@@ -20,6 +20,12 @@ Environment=PR_GATEWAY_PORT=8645
 Environment=PR_GATEWAY_GH_PORT=8646
 Environment=PR_GATEWAY_TARGET_URL=http://localhost:8644
 Environment=PR_GATEWAY_POLL_INTERVAL=30
+# Environment=PR_GATEWAY_API_BIND=0.0.0.0
+# Environment=PR_GATEWAY_GH_BIND=0.0.0.0
+# Environment=GH_TOKEN_FILE=~/.secrets/gh-token
+# Environment=PR_GATEWAY_COALESCE_WINDOW=15
+# Environment=PR_GATEWAY_AGENT_TIMEOUT=600
+# Environment=PR_GATEWAY_BASIC_AUTH=user:password
 
 # Per-repo webhook secrets (double-underscore separates owner from repo name)
 # Environment=WEBHOOK_SECRET_apache__maven=your-secret-here

@@ -209,6 +209,18 @@ In the GitHub repo settings → Webhooks → Add webhook:
 
 Useful for testing or manually re-triggering a handler.
 
+### `GET /settings` — Current runtime settings (JSON)
+
+Returns coalesce_window, agent_timeout, poll_interval (writable), plus read-only bind/port/auth info.
+
+### `POST /settings` — Update runtime-mutable settings
+
+```json
+{"coalesce_window": 30, "agent_timeout": 900, "poll_interval": 60}
+```
+
+Only `coalesce_window`, `agent_timeout`, and `poll_interval` are writable. Changes take effect immediately but are not persisted across restarts.
+
 ### `POST /repo-secret` — Set a per-repo webhook secret at runtime
 
 ```json
@@ -223,8 +235,14 @@ Useful for testing or manually re-triggering a handler.
 | `PR_GATEWAY_TARGET_URL` | `http://localhost:8644` | Base URL of the webhook receiver |
 | `PR_GATEWAY_PORT` | `8645` | Internal API port |
 | `PR_GATEWAY_GH_PORT` | `8646` | Public GitHub webhook receiver port |
+| `PR_GATEWAY_API_BIND` | `0.0.0.0` | Bind interface for the internal API server |
+| `PR_GATEWAY_GH_BIND` | `0.0.0.0` | Bind interface for the GitHub webhook receiver |
 | `PR_GATEWAY_POLL_INTERVAL` | `30` | GitHub poll interval in seconds |
-| `GH_TOKEN` | *(from `~/.secrets/gh-token`)* | GitHub API token |
+| `PR_GATEWAY_COALESCE_WINDOW` | `15` | Coalesce window in seconds (trailing-edge timer before dispatch) |
+| `PR_GATEWAY_AGENT_TIMEOUT` | `600` | Agent timeout in seconds (listener unlocked after this) |
+| `PR_GATEWAY_BASIC_AUTH` | *(empty = disabled)* | Optional HTTP Basic Auth for the internal API (`user:password`) |
+| `GH_TOKEN` | *(from `GH_TOKEN_FILE`)* | GitHub API token |
+| `GH_TOKEN_FILE` | `~/.secrets/gh-token` | Path to file containing the GitHub token |
 | `WEBHOOK_SECRET_owner__repo` | *(falls back to `PR_GATEWAY_WEBHOOK_SECRET`)* | Per-repo GitHub webhook secret |
 
 ## systemd

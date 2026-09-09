@@ -37,6 +37,7 @@ dispatched to N listeners based on their signal filters).
 Registry is persisted to REGISTRY_FILE for crash recovery.
 """
 
+import base64
 import hashlib
 import hmac
 import json
@@ -60,16 +61,63 @@ from urllib.request import Request, urlopen
 
 SCRIPTS_DIR   = Path(__file__).parent
 REGISTRY_FILE = SCRIPTS_DIR / "pr-gateway-registry.json"
-GH_TOKEN_FILE = Path("/opt/data/.secrets/gh-token")
+GH_TOKEN_FILE = Path(os.environ.get("GH_TOKEN_FILE", "~/.secrets/gh-token")).expanduser()
 LOG_FILE      = SCRIPTS_DIR / "pr-gateway.log"
 PID_FILE      = SCRIPTS_DIR / "pr-gateway.pid"
 
 API_PORT      = int(os.environ.get("PR_GATEWAY_PORT", "8645"))       # internal only
+API_BIND      = os.environ.get("PR_GATEWAY_API_BIND", "0.0.0.0")    # bind for internal API
 GH_PORT       = int(os.environ.get("PR_GATEWAY_GH_PORT", "8646"))    # public, GitHub webhooks
+GH_BIND       = os.environ.get("PR_GATEWAY_GH_BIND", "0.0.0.0")     # bind for GH webhook
 TARGET_URL    = os.environ.get("PR_GATEWAY_TARGET_URL", "http://localhost:8644")
 WEBHOOK_SECRET = os.environ.get("PR_GATEWAY_WEBHOOK_SECRET", "")
 POLL_INTERVAL = int(os.environ.get("PR_GATEWAY_POLL_INTERVAL", "30"))
 GITHUB_API    = "https://api.github.com"
+
+# ---------------------------------------------------------------------------
+# Basic Auth for the internal API (port 8645)
+# ---------------------------------------------------------------------------
+
+_BASIC_AUTH_RAW = os.environ.get("PR_GATEWAY_BASIC_AUTH", "").strip()
+_BASIC_AUTH: Optional[tuple[str, str]] = None
+if _BASIC_AUTH_RAW and ":" in _BASIC_AUTH_RAW:
+    _u, _p = _BASIC_AUTH_RAW.split(":", 1)
+    _BASIC_AUTH = (_u, _p)
+
+
+def _check_basic_auth(handler: 'BaseHTTPRequestHandler') -> bool:
+    """Verify HTTP Basic Auth on the internal API.  Returns True if OK or auth is disabled."""
+    if _BASIC_AUTH is None:
+        return True
+    auth_header = handler.headers.get("Authorization", "")
+    if not auth_header.startswith("Basic "):
+        handler.send_response(401)
+        handler.send_header("WWW-Authenticate", 'Basic realm="PR Gateway"')
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return False
+    try:
+        decoded = base64.b64decode(auth_header[6:]).decode("utf-8")
+    except Exception:
+        handler.send_response(401)
+        handler.send_header("WWW-Authenticate", 'Basic realm="PR Gateway"')
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return False
+    if ":" not in decoded:
+        handler.send_response(401)
+        handler.send_header("WWW-Authenticate", 'Basic realm="PR Gateway"')
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+        return False
+    user, passwd = decoded.split(":", 1)
+    if hmac.compare_digest(user, _BASIC_AUTH[0]) and hmac.compare_digest(passwd, _BASIC_AUTH[1]):
+        return True
+    handler.send_response(401)
+    handler.send_header("WWW-Authenticate", 'Basic realm="PR Gateway"')
+    handler.send_header("Content-Length", "0")
+    handler.end_headers()
+    return False
 
 ALL_SIGNALS   = {"PUSHED", "OPENED", "MERGED", "CLOSED", "DRAFT",
                  "CI_GREEN", "CI_FAILED", "CI_CANCELLED",
@@ -159,8 +207,11 @@ _pr_state:  dict[str, dict] = {}
 #   CI_FAILED supersedes CI_GREEN               (latest CI result wins)
 #   All other signal types are kept independently.
 
-_COALESCE_WINDOW_S = 15    # seconds to wait after last identical signal before dispatch
-_AGENT_TIMEOUT_S   = 600   # pessimistic max agent runtime; listener unlocked after this
+_COALESCE_WINDOW_S = int(os.environ.get("PR_GATEWAY_COALESCE_WINDOW", "15"))
+_AGENT_TIMEOUT_S   = int(os.environ.get("PR_GATEWAY_AGENT_TIMEOUT", "600"))
+
+# Lock protecting runtime-mutable settings (_COALESCE_WINDOW_S, _AGENT_TIMEOUT_S, POLL_INTERVAL)
+_settings_lock = threading.Lock()
 
 _pending_lock = threading.Lock()
 
@@ -441,6 +492,14 @@ def remove_watch(repo: str, pr: int, route: Optional[str] = None) -> tuple[bool,
     save_registry()
     for k in removed:
         log.info("Removed listener: %s", k)
+
+    # Clean up coalesce/dispatch queues for removed listeners (Bug 3)
+    with _pending_lock:
+        for lkey in removed:
+            q = _listener_queues.pop(lkey, None)
+            if q and q.get("timer") is not None:
+                q["timer"].cancel()
+
     return True, f"Removed {len(removed)} listener(s): {', '.join(removed)}"
 
 
@@ -952,6 +1011,61 @@ def _html_response(handler: BaseHTTPRequestHandler, code: int, html: str) -> Non
     handler.wfile.write(body)
 
 
+def _get_settings() -> dict:
+    """Return current runtime settings."""
+    with _settings_lock:
+        return {
+            "coalesce_window": _COALESCE_WINDOW_S,
+            "agent_timeout": _AGENT_TIMEOUT_S,
+            "poll_interval": POLL_INTERVAL,
+            "api_bind": API_BIND,
+            "api_port": API_PORT,
+            "gh_bind": GH_BIND,
+            "gh_port": GH_PORT,
+            "auth_enabled": _BASIC_AUTH is not None,
+        }
+
+
+def _update_settings(body: dict) -> tuple[bool, dict | str]:
+    """Update runtime-mutable settings.  Returns (ok, settings_dict | error_string)."""
+    global _COALESCE_WINDOW_S, _AGENT_TIMEOUT_S, POLL_INTERVAL
+    writable = {"coalesce_window", "agent_timeout", "poll_interval"}
+    unknown = set(body.keys()) - writable
+    if unknown:
+        return False, f"Unknown/read-only settings: {sorted(unknown)}"
+    if not body:
+        return False, "No settings provided"
+
+    errors = []
+    for key, val in body.items():
+        if not isinstance(val, int) or val < 0:
+            errors.append(f"{key} must be a positive integer")
+    if errors:
+        return False, "; ".join(errors)
+
+    cw = body.get("coalesce_window")
+    at = body.get("agent_timeout")
+    pi = body.get("poll_interval")
+
+    if cw is not None and cw < 1:
+        return False, "coalesce_window must be >= 1"
+    if at is not None and at < 30:
+        return False, "agent_timeout must be >= 30"
+    if pi is not None and pi < 10:
+        return False, "poll_interval must be >= 10"
+
+    with _settings_lock:
+        if cw is not None:
+            _COALESCE_WINDOW_S = cw
+        if at is not None:
+            _AGENT_TIMEOUT_S = at
+        if pi is not None:
+            POLL_INTERVAL = pi
+
+    log.info("Settings updated: %s", body)
+    return True, _get_settings()
+
+
 def _render_dashboard() -> str:
     """Render the dashboard HTML with current listener state."""
     with _registry_lock:
@@ -1103,6 +1217,7 @@ def _render_dashboard() -> str:
 <div class="tabs">
   <div class="tab active" onclick="showTab('listeners',this)">Listeners</div>
   <div class="tab" onclick="showTab('history',this)">History</div>
+  <div class="tab" onclick="showTab('settings',this)">Settings</div>
 </div>
 <div class="toolbar">
   <label>Auto-refresh:
@@ -1157,6 +1272,39 @@ def _render_dashboard() -> str:
       <tbody id="htbl-body"><tr><td colspan="8" style="color:#6b7280;text-align:center;padding:2rem">Loading…</td></tr></tbody>
     </table>
   </div>
+
+  <!-- Settings pane -->
+  <div class="pane" id="pane-settings">
+    <div style="max-width:600px">
+      <h2 style="font-size:1rem;font-weight:600;color:#f8fafc;margin:0 0 1rem">Runtime Settings</h2>
+      <p style="font-size:.78rem;color:#94a3b8;margin-bottom:1.25rem">
+        ⚠ Runtime changes are not persisted across restarts. Use env vars for permanent configuration.
+      </p>
+      <div style="display:flex;flex-direction:column;gap:.75rem;margin-bottom:1.5rem">
+        <div style="display:flex;align-items:center;gap:1rem">
+          <label style="width:180px;font-size:.85rem;color:#94a3b8">Coalesce Window (s)</label>
+          <input id="set-coalesce" type="number" min="1" style="width:100px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 8px;font-size:.85rem">
+        </div>
+        <div style="display:flex;align-items:center;gap:1rem">
+          <label style="width:180px;font-size:.85rem;color:#94a3b8">Agent Timeout (s)</label>
+          <input id="set-timeout" type="number" min="30" style="width:100px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 8px;font-size:.85rem">
+        </div>
+        <div style="display:flex;align-items:center;gap:1rem">
+          <label style="width:180px;font-size:.85rem;color:#94a3b8">Poll Interval (s)</label>
+          <input id="set-poll" type="number" min="10" style="width:100px;background:#0f172a;color:#e2e8f0;border:1px solid #334155;border-radius:4px;padding:4px 8px;font-size:.85rem">
+        </div>
+        <div style="margin-top:.5rem">
+          <button class="btn btn-fire" onclick="saveSettings()">💾 Save</button>
+        </div>
+      </div>
+      <h3 style="font-size:.9rem;font-weight:600;color:#f8fafc;margin:0 0 .75rem">Read-only (startup)</h3>
+      <table style="width:auto;font-size:.85rem">
+        <tr><td style="color:#94a3b8;padding-right:2rem">API bind:port</td><td id="ro-api">—</td></tr>
+        <tr><td style="color:#94a3b8;padding-right:2rem">GH webhook bind:port</td><td id="ro-gh">—</td></tr>
+        <tr><td style="color:#94a3b8;padding-right:2rem">Auth enabled</td><td id="ro-auth">—</td></tr>
+      </table>
+    </div>
+  </div>
 </main>
 
 <!-- Fire modal -->
@@ -1186,6 +1334,7 @@ function showTab(name, el) {{
   document.getElementById('pane-' + name).classList.add('active');
   location.hash = name;
   if (name === 'history') loadHistory();
+  if (name === 'settings') loadSettings();
 }}
 
 // --- Fire modal ---
@@ -1291,6 +1440,33 @@ function toast(msg, ok) {{
   setTimeout(() => t.remove(), 3000);
 }}
 
+// --- Settings ---
+function loadSettings() {{
+  fetch('/settings').then(r => r.json()).then(s => {{
+    document.getElementById('set-coalesce').value = s.coalesce_window;
+    document.getElementById('set-timeout').value = s.agent_timeout;
+    document.getElementById('set-poll').value = s.poll_interval;
+    document.getElementById('ro-api').textContent = s.api_bind + ':' + s.api_port;
+    document.getElementById('ro-gh').textContent = s.gh_bind + ':' + s.gh_port;
+    document.getElementById('ro-auth').textContent = s.auth_enabled ? 'Yes' : 'No';
+  }}).catch(e => toast('Failed to load settings: ' + e, false));
+}}
+function saveSettings() {{
+  var body = {{
+    coalesce_window: parseInt(document.getElementById('set-coalesce').value),
+    agent_timeout: parseInt(document.getElementById('set-timeout').value),
+    poll_interval: parseInt(document.getElementById('set-poll').value)
+  }};
+  fetch('/settings', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify(body)
+  }}).then(r => r.json()).then(d => {{
+    if (d.ok) {{ toast('Settings saved', true); loadSettings(); }}
+    else toast('Error: ' + d.error, false);
+  }}).catch(e => toast('Request failed: ' + e, false));
+}}
+
 // --- Auto-refresh ---
 var _timer;
 function setRefresh(secs) {{
@@ -1305,6 +1481,9 @@ setRefresh(30);
   if (tab === 'history') {{
     var el = document.querySelector('.tab[onclick*="history"]');
     if (el) showTab('history', el);
+  }} else if (tab === 'settings') {{
+    var el = document.querySelector('.tab[onclick*="settings"]');
+    if (el) showTab('settings', el);
   }}
 }})();
 
@@ -1385,12 +1564,19 @@ class GatewayHandler(BaseHTTPRequestHandler):
             _json_response(self, 200, {
                 "status": "ok", "listeners": n_listeners, "prs": n_prs,
             })
+            return
 
-        elif path == "/watches":
+        if not _check_basic_auth(self):
+            return
+
+        if path == "/watches":
             _json_response(self, 200, list_watches())
 
         elif path == "/history":
             _json_response(self, 200, _get_history())
+
+        elif path == "/settings":
+            _json_response(self, 200, _get_settings())
 
         elif path in ("/ui", ""):
             _html_response(self, 200, _render_dashboard())
@@ -1399,6 +1585,9 @@ class GatewayHandler(BaseHTTPRequestHandler):
             _json_response(self, 404, {"error": "not found"})
 
     def do_POST(self):
+        if not _check_basic_auth(self):
+            return
+
         path = urlparse(self.path).path.rstrip("/")
 
         if path == "/watch":
@@ -1459,10 +1648,24 @@ class GatewayHandler(BaseHTTPRequestHandler):
             log.info("Set webhook secret for %s", repo)
             _json_response(self, 200, {"ok": True, "message": f"Secret set for {repo}"})
 
+        elif path == "/settings":
+            body = _read_body(self)
+            if body is None:
+                _json_response(self, 400, {"error": "invalid JSON"})
+                return
+            ok, result = _update_settings(body)
+            if ok:
+                _json_response(self, 200, {"ok": True, "settings": result})
+            else:
+                _json_response(self, 400, {"ok": False, "error": result})
+
         else:
             _json_response(self, 404, {"error": "not found"})
 
     def do_DELETE(self):
+        if not _check_basic_auth(self):
+            return
+
         path = urlparse(self.path).path.rstrip("/")
         parsed = _parse_watch_path(path)
         if not parsed:
@@ -1475,8 +1678,8 @@ class GatewayHandler(BaseHTTPRequestHandler):
 
 
 def api_server() -> None:
-    server = HTTPServer(("0.0.0.0", API_PORT), GatewayHandler)
-    log.info("API server listening on http://0.0.0.0:%d  (LAN accessible)", API_PORT)
+    server = HTTPServer((API_BIND, API_PORT), GatewayHandler)
+    log.info("API server listening on http://%s:%d  (LAN accessible)", API_BIND, API_PORT)
     server.serve_forever()
 
 
@@ -1677,20 +1880,52 @@ def _extract_pr_number(event: str, payload: dict) -> Optional[int]:
     """Extract the PR number from a GitHub webhook payload."""
     if event == "pull_request":
         return payload.get("pull_request", {}).get("number")
-    elif event in ("check_run", "check_suite"):
-        # check_run.pull_requests is a list
-        prs = payload.get(event.replace("_", "_"), {}).get("pull_requests", [])
-        if prs:
-            return prs[0].get("number")
-        # check_suite may not have PR list — skip
-        return None
     elif event == "pull_request_review":
         return payload.get("pull_request", {}).get("number")
+    elif event == "pull_request_review_comment":
+        return payload.get("pull_request", {}).get("number")
+    elif event in ("check_run", "check_suite"):
+        prs = payload.get(event, {}).get("pull_requests", [])
+        if prs:
+            return prs[0].get("number")
+        # Fallback: SHA-based lookup in _pr_state
+        head_sha = payload.get(event, {}).get("head_sha")
+        if head_sha:
+            return _find_pr_by_sha(head_sha)
+        return None
+    elif event == "workflow_run":
+        # Try pull_requests list first
+        wf_prs = payload.get("workflow_run", {}).get("pull_requests", [])
+        if wf_prs:
+            return wf_prs[0].get("number")
+        # Fallback: SHA-based lookup
+        head_sha = payload.get("workflow_run", {}).get("head_sha")
+        if head_sha:
+            return _find_pr_by_sha(head_sha)
+        return None
+    elif event == "status":
+        # Legacy commit status — SHA-based lookup
+        head_sha = payload.get("sha")
+        if head_sha:
+            return _find_pr_by_sha(head_sha)
+        return None
     elif event == "issue_comment":
         # Only applicable if it's a PR
         issue = payload.get("issue", {})
         if "pull_request" in issue:
             return issue.get("number")
+    return None
+
+
+def _find_pr_by_sha(sha: str) -> Optional[int]:
+    """Scan _pr_state for a PR whose head SHA matches.  Returns the PR number if exactly one match."""
+    with _registry_lock:
+        matches = [
+            state["pr"] for state in _pr_state.values()
+            if state.get("_head_sha") == sha
+        ]
+    if len(matches) == 1:
+        return matches[0]
     return None
 
 
@@ -1745,8 +1980,8 @@ def _load_secrets_from_env() -> None:
 
 
 def gh_webhook_server() -> None:
-    server = HTTPServer(("0.0.0.0", GH_PORT), GitHubWebhookHandler)
-    log.info("GitHub webhook receiver on http://0.0.0.0:%d  (public)", GH_PORT)
+    server = HTTPServer((GH_BIND, GH_PORT), GitHubWebhookHandler)
+    log.info("GitHub webhook receiver on http://%s:%d  (public)", GH_BIND, GH_PORT)
     server.serve_forever()
 
 

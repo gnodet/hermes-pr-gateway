@@ -17,6 +17,12 @@ export PR_GATEWAY_TARGET_URL="${PR_GATEWAY_TARGET_URL:-http://localhost:8644}"
 export PR_GATEWAY_ROUTE="${PR_GATEWAY_ROUTE:-babysit-pr}"
 export PR_GATEWAY_POLL_INTERVAL="${PR_GATEWAY_POLL_INTERVAL:-30}"
 
+export PR_GATEWAY_API_BIND="${PR_GATEWAY_API_BIND:-0.0.0.0}"
+export PR_GATEWAY_GH_BIND="${PR_GATEWAY_GH_BIND:-0.0.0.0}"
+export GH_TOKEN_FILE="${GH_TOKEN_FILE:-~/.secrets/gh-token}"
+export PR_GATEWAY_COALESCE_WINDOW="${PR_GATEWAY_COALESCE_WINDOW:-15}"
+export PR_GATEWAY_AGENT_TIMEOUT="${PR_GATEWAY_AGENT_TIMEOUT:-600}"
+
 _load_secrets() {
     # Load per-repo webhook secrets from an optional secrets file
     local secrets_file="${SECRETS_FILE:-/opt/data/.secrets/pr-gateway-webhook-secrets.env}"
@@ -47,7 +53,7 @@ case "$cmd" in
         exit 0
     fi
     echo "Starting pr-gateway..."
-    nohup python3 "$GATEWAY" >> /dev/null 2>&1 &
+    nohup python3 "$GATEWAY" >> "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 1
     if is_running; then
