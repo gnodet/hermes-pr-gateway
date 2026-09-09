@@ -14,21 +14,24 @@ export PR_GATEWAY_PORT="${PR_GATEWAY_PORT:-8645}"
 export PR_GATEWAY_GH_PORT="${PR_GATEWAY_GH_PORT:-8646}"
 export PR_GATEWAY_HERMES_URL="${PR_GATEWAY_HERMES_URL:-http://localhost:8644}"
 
-# Load per-repo webhook secrets from vault
-SECRETS_FILE="/opt/data/.secrets/pr-gateway-webhook-secrets.env"
-if [ -f "$SECRETS_FILE" ]; then
-    set -a
-    # shellcheck disable=SC1090
-    source "$SECRETS_FILE"
-    set +a
-fi
-if [[ -z "${PR_GATEWAY_HERMES_SECRET:-}" ]]; then
-    echo "ERROR: PR_GATEWAY_HERMES_SECRET is not set. Set it in your secrets file or environment." >&2
-    exit 1
-fi
-export PR_GATEWAY_HERMES_SECRET
 export PR_GATEWAY_ROUTE="${PR_GATEWAY_ROUTE:-babysit-pr}"
 export PR_GATEWAY_POLL_INTERVAL="${PR_GATEWAY_POLL_INTERVAL:-30}"
+
+_load_secrets() {
+    # Load per-repo webhook secrets from an optional secrets file
+    local secrets_file="${SECRETS_FILE:-/opt/data/.secrets/pr-gateway-webhook-secrets.env}"
+    if [ -f "$secrets_file" ]; then
+        set -a
+        # shellcheck disable=SC1090
+        source "$secrets_file"
+        set +a
+    fi
+    if [[ -z "${PR_GATEWAY_HERMES_SECRET:-}" ]]; then
+        echo "ERROR: PR_GATEWAY_HERMES_SECRET is not set. Set it in your secrets file or environment." >&2
+        exit 1
+    fi
+    export PR_GATEWAY_HERMES_SECRET
+}
 
 is_running() {
     [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE")" 2>/dev/null
@@ -38,6 +41,7 @@ cmd="${1:-status}"
 
 case "$cmd" in
   start)
+    _load_secrets
     if is_running; then
         echo "pr-gateway already running (pid=$(cat "$PID_FILE"))"
         exit 0
