@@ -916,7 +916,7 @@ def poller_loop() -> None:
                 prev_ci     = state.get("_ci_status")
                 prev_updated = state.get("_updated_at")
 
-                # First time — initialise state, emit nothing
+                # First time seeing this PR — initialise state and emit OPENED
                 if prev_sha is None:
                     cur_ci = get_ci_status(repo, cur_sha) if cur_sha else "unknown"
                     _update_pr_state(prkey,
@@ -924,6 +924,8 @@ def poller_loop() -> None:
                         _updated_at=cur_updated, _last_polled=time.time())
                     log.info("Initialised state for %s (sha=%.8s, ci=%s)",
                              prkey, cur_sha or "?", cur_ci)
+                    _record("poll_signal", repo, pr_num, "OPENED", detail="pulls_body")
+                    _dispatch_signals(prkey, ["OPENED"])
                     continue
 
                 signals = []
@@ -933,15 +935,28 @@ def poller_loop() -> None:
                     cur_ci = get_ci_status(repo, cur_sha)
                     if cur_ci == "failure" and prev_ci != "failure":
                         signals.append("CI_FAILED")
-                    elif cur_ci == "success" and (prev_ci != "success" or cur_sha != prev_sha):
+                    elif cur_ci == "success" and prev_ci != "success":
                         signals.append("CI_GREEN")
                     _update_pr_state(prkey,
                         _head_sha=cur_sha, _ci_status=cur_ci,
                         _updated_at=cur_updated, _last_polled=time.time())
-                elif prev_updated and cur_updated and cur_updated != prev_updated:
-                    signals.append("NEW_COMMENTS")
-                    _update_pr_state(prkey,
-                        _updated_at=cur_updated, _last_polled=time.time())
+                else:
+                    # SHA unchanged — check CI transition (pending→success/failure)
+                    # and updated_at for comments. Both can happen without a push.
+                    if cur_sha and prev_ci not in ("success", "failure"):
+                        cur_ci = get_ci_status(repo, cur_sha)
+                        if cur_ci == "success" and prev_ci != "success":
+                            signals.append("CI_GREEN")
+                            _update_pr_state(prkey,
+                                _ci_status=cur_ci, _last_polled=time.time())
+                        elif cur_ci == "failure" and prev_ci != "failure":
+                            signals.append("CI_FAILED")
+                            _update_pr_state(prkey,
+                                _ci_status=cur_ci, _last_polled=time.time())
+                    if prev_updated and cur_updated and cur_updated != prev_updated:
+                        signals.append("NEW_COMMENTS")
+                        _update_pr_state(prkey,
+                            _updated_at=cur_updated, _last_polled=time.time())
 
                 if signals:
                     for sig in signals:
