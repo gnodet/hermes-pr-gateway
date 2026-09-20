@@ -144,7 +144,7 @@ def _record(kind: str, repo: str, pr: int, signal: str,
     """Append one event to the in-memory history ring buffer."""
     entry = {
         "ts":     time.time(),
-        "kind":   kind,    # webhook_received | poll_signal | dispatched | skipped | coalesced
+        "kind":   kind,    # webhook_received | poll_signal | dispatched | skipped | coalesced | agent_done
         "repo":   repo,
         "pr":     pr,
         "signal": signal,
@@ -232,6 +232,11 @@ def _lq(lkey: str) -> dict:
             "pending":     {},
             "running":     False,
             "run_started": None,
+            # Agent lifecycle tracking (visible in dashboard)
+            "agent_status":      None,   # None | "running" | "done" | "error"
+            "agent_started_at":  None,   # float timestamp
+            "agent_finished_at": None,   # float timestamp
+            "agent_signal":      None,   # signal that triggered the last run
         }
     return _listener_queues[lkey]
 
@@ -254,8 +259,12 @@ def _dispatch_pending(lkey: str, listener: dict) -> None:
         return
     signals_to_send = list(q["pending"].keys())
     q["pending"].clear()
-    q["running"]     = True
-    q["run_started"] = time.time()
+    q["running"]          = True
+    q["run_started"]      = time.time()
+    q["agent_status"]     = "running"
+    q["agent_started_at"] = time.time()
+    q["agent_signal"]     = signals_to_send[0] if signals_to_send else None
+    q["agent_finished_at"] = None
     threading.Thread(
         target=_run_and_drain, args=(lkey, listener, signals_to_send),
         daemon=True, name=f"dispatch-{lkey}",
@@ -265,16 +274,21 @@ def _dispatch_pending(lkey: str, listener: dict) -> None:
 def _run_and_drain(lkey: str, listener: dict, signals: list[str]) -> None:
     """Send signals to Hermes then check if more are waiting (runs in its own thread)."""
     repo_pr = f"{listener['repo']}#{listener['pr']}"
+    dispatch_ok = True
     for sig in signals:
         log.info("Dispatching %s → %s [%s]", sig, repo_pr, listener["route"])
         ok = notify_target(listener, sig)
+        if not ok:
+            dispatch_ok = False
         _record("dispatched", listener["repo"], listener["pr"], sig,
                 route=listener["route"],
                 result="ok" if ok else "error")
     with _pending_lock:
         q = _lq(lkey)
-        q["running"]     = False
-        q["run_started"] = None
+        q["running"]           = False
+        q["run_started"]       = None
+        q["agent_status"]      = "done" if dispatch_ok else "error"
+        q["agent_finished_at"] = time.time()
         if q["pending"]:
             _dispatch_pending(lkey, listener)
 
@@ -509,6 +523,28 @@ def list_watches() -> list[dict]:
             {k: v for k, v in entry.items() if not k.startswith("_")}
             for entry in _listeners.values()
         ]
+
+
+def _agent_done(repo: str, pr: int, route: str, status: str) -> tuple[bool, str]:
+    """Mark an agent session as finished (called by POST /agent-done)."""
+    lkey = _listener_key(repo, pr, route)
+    with _pending_lock:
+        q = _listener_queues.get(lkey)
+        if q is None:
+            # Listener may have been removed; still record the event
+            _record("agent_done", repo, pr, "", route=route, result=status,
+                    detail="listener not found")
+            return False, f"No queue found for {lkey}"
+        q["agent_status"]      = status  # "done" | "error"
+        q["agent_finished_at"] = time.time()
+        if q.get("running"):
+            # Agent reported done before our timeout — unlock the serialisation layer
+            q["running"]     = False
+            q["run_started"] = None
+    _record("agent_done", repo, pr, "", route=route, result=status,
+            detail="self-reported")
+    log.info("Agent done: %s [%s] status=%s", lkey, route, status)
+    return True, f"Recorded agent-done for {lkey}"
 
 
 def _get_pr_state_snapshot() -> dict[str, dict]:
@@ -1133,6 +1169,35 @@ def _render_dashboard() -> str:
         ci_color = {"success": "#15803d", "failure": "#dc2626", "pending": "#d97706"}.get(ci, "#6b7280")
         last_polled = _fmt_ts(ps.get("_last_polled"))
 
+        # Agent lifecycle state from _listener_queues
+        lkey_str = _listener_key(repo, pr, route)
+        with _pending_lock:
+            lq = _listener_queues.get(lkey_str, {})
+            agent_status      = lq.get("agent_status")
+            agent_started_at  = lq.get("agent_started_at")
+            agent_finished_at = lq.get("agent_finished_at")
+            agent_signal      = lq.get("agent_signal")
+
+        if agent_status == "running":
+            elapsed = int(time.time() - agent_started_at) if agent_started_at else 0
+            m, s = divmod(elapsed, 60)
+            elapsed_str = f"{m}m{s:02d}s" if m else f"{s}s"
+            sig_label = f" ({agent_signal})" if agent_signal else ""
+            agent_cell = f'<span style="color:#facc15;font-weight:600">🟡 running{sig_label} {elapsed_str}</span>'
+        elif agent_status == "done":
+            ago = int(time.time() - agent_finished_at) if agent_finished_at else 0
+            ago_m, ago_s = divmod(ago, 60)
+            ago_str = f"{ago_m}m ago" if ago_m else f"{ago_s}s ago"
+            sig_label = f" ({agent_signal})" if agent_signal else ""
+            agent_cell = f'<span style="color:#4ade80;font-weight:600">✅ done{sig_label} {ago_str}</span>'
+        elif agent_status == "error":
+            ago = int(time.time() - agent_finished_at) if agent_finished_at else 0
+            ago_m, ago_s = divmod(ago, 60)
+            ago_str = f"{ago_m}m ago" if ago_m else f"{ago_s}s ago"
+            agent_cell = f'<span style="color:#f87171;font-weight:600">🔴 error {ago_str}</span>'
+        else:
+            agent_cell = '<span style="color:#475569">—</span>'
+
         rows.append(f"""
         <tr>
           <td><strong>{repo}</strong></td>
@@ -1144,6 +1209,7 @@ def _render_dashboard() -> str:
           <td><code style="font-size:0.75em">{l.get("deliver","—")}</code></td>
           <td>{sha_display}</td>
           <td><span style="color:{ci_color};font-weight:600">{ci}</span></td>
+          <td>{agent_cell}</td>
           <td>{last_polled}</td>
           <td>{_fmt_ts(l.get("added_at"))}</td>
           <td class="actions">
@@ -1152,7 +1218,7 @@ def _render_dashboard() -> str:
           </td>
         </tr>""")
 
-    rows_html = "\n".join(rows) if rows else '<tr><td colspan="12" style="text-align:center;color:#6b7280;padding:2rem">No listeners registered</td></tr>'
+    rows_html = "\n".join(rows) if rows else '<tr><td colspan="13" style="text-align:center;color:#6b7280;padding:2rem">No listeners registered</td></tr>'
 
     return f"""<!DOCTYPE html>
 <html lang="en">
@@ -1207,6 +1273,7 @@ def _render_dashboard() -> str:
     .k-poll_signal      {{ background: #1d4ed8; }}
     .k-coalesced        {{ background: #0891b2; }}
     .k-dispatched       {{ background: #15803d; }}
+    .k-agent_done       {{ background: #065f46; }}
     .k-skipped          {{ background: #6b7280; }}
     /* Modal */
     .modal-bg {{ display:none; position:fixed; inset:0; background:#00000099; z-index:100; align-items:center; justify-content:center; }}
@@ -1252,7 +1319,7 @@ def _render_dashboard() -> str:
       <thead><tr>
         <th>Repo</th><th>PR</th><th>Route</th><th>Signals</th>
         <th>Source</th><th>Branch</th><th>Deliver</th>
-        <th>Head SHA</th><th>CI</th><th>Last polled</th><th>Registered</th><th>Actions</th>
+        <th>Head SHA</th><th>CI</th><th>Agent</th><th>Last polled</th><th>Registered</th><th>Actions</th>
       </tr></thead>
       <tbody>{rows_html}</tbody>
     </table>
@@ -1268,6 +1335,7 @@ def _render_dashboard() -> str:
         <option value="poll_signal">poll_signal</option>
         <option value="coalesced">coalesced</option>
         <option value="dispatched">dispatched</option>
+        <option value="agent_done">agent_done</option>
         <option value="skipped">skipped</option>
       </select>
       <select id="hf-result" onchange="filterHistory()">
@@ -1391,7 +1459,7 @@ function removeListener(lkey, btn) {{
 // --- History ---
 var KIND_COLORS = {{
   webhook_received: '#7c3aed', poll_signal: '#1d4ed8',
-  coalesced: '#0891b2', dispatched: '#15803d', skipped: '#6b7280'
+  coalesced: '#0891b2', dispatched: '#15803d', agent_done: '#065f46', skipped: '#6b7280'
 }};
 var SIG_COLORS = {{
   PUSHED:'#2563eb', OPENED:'#16a34a', MERGED:'#7c3aed', CLOSED:'#6b7280',
@@ -1647,6 +1715,32 @@ class GatewayHandler(BaseHTTPRequestHandler):
                 "ok": True,
                 "message": f"Fired {signal} → {prkey} ({len(listeners)} listener(s))",
             })
+
+        elif path == "/agent-done":
+            # POST {"repo": "owner/repo", "pr": 123, "route": "babysit-pr", "status": "done"}
+            # Called by skills at the end of a session to mark the agent as finished.
+            # No auth required from the skill side (it runs on localhost), but
+            # we still require Basic Auth to protect against external abuse.
+            body = _read_body(self)
+            if body is None:
+                _json_response(self, 400, {"error": "invalid JSON"})
+                return
+            repo   = body.get("repo", "").strip()
+            pr_raw = body.get("pr")
+            route  = body.get("route", "babysit-pr").strip()
+            status = body.get("status", "done").strip()
+            if not repo or pr_raw is None:
+                _json_response(self, 400, {"error": "repo and pr are required"})
+                return
+            if status not in ("done", "error"):
+                status = "done"
+            try:
+                pr = int(pr_raw)
+            except (TypeError, ValueError):
+                _json_response(self, 400, {"error": "pr must be an integer"})
+                return
+            ok, msg = _agent_done(repo, pr, route, status)
+            _json_response(self, 200, {"ok": ok, "message": msg})
 
         elif path == "/repo-secret":
             # POST {"repo": "owner/repo", "secret": "..."}
